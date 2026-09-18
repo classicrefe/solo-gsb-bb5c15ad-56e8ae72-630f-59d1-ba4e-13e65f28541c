@@ -5,7 +5,9 @@
 稳定顺序回放：
 
 - 滚动窗口过期与"多桶全放行/全拒绝"规则与线上 ``consume`` 完全一致，
-  但所有状态只保存在本模块的内存结构中；
+  包括多级配额树：直接消费按当前 ``parent_key`` 展开为整条贡献链
+  （叶桶直接占用 + 全部祖先派生占用，共享祖先只汇总一次），每一层
+  独立校验限额；所有状态只保存在本模块的内存结构中；
 - 只回放消费（放行才占额度，拒绝不占），不处理 release——即回放的是
   "首次消费判定形成的原始用量流"，释放在模拟中忽略；
 - ``start`` 之前再取各桶生效窗口的最大值作为预热期，预热记录只建立
@@ -17,6 +19,8 @@ from __future__ import annotations
 
 from collections import deque
 from typing import Any, Deque
+
+from . import tree
 
 # 判定翻转明细最多返回条数
 FLIP_DETAIL_LIMIT = 100
@@ -96,15 +100,21 @@ def run_simulation(
     records: list[tuple[float, str, list[dict[str, Any]], bool]],
     configs: dict[str, tuple[int, float]],
     start: float,
+    parents: dict[str, str | None] | None = None,
 ) -> dict[str, Any]:
     """在隔离内存中回放首次消费载荷并重算判定。
 
     :param records: ``(created_at, request_id, items, actual_allowed)``，
-        items 为规范化后的 ``[{"key", "amount"}]``；调用方须保证已按
-        ``(created_at, request_id)`` 升序排列，且时间覆盖预热起点。
-    :param configs: 全部已配置桶的生效 ``{key: (limit, window)}``。
+        items 为规范化后的直接消费条目 ``[{"key", "amount"}]``；调用方须
+        保证已按 ``(created_at, request_id)`` 升序排列，且时间覆盖预热起点。
+    :param configs: 全部已配置桶（含可能作为祖先出现的桶）的生效
+        ``{key: (limit, window)}``。
     :param start: 统计区间起点（epoch 秒）；``created_at < start`` 仅预热。
+    :param parents: 全部桶的当前父级映射 ``{key: parent_key or None}``，
+        与线上消费一致地把直接条目展开为贡献链；None/空表示所有桶为根。
     """
+    if parents is None:
+        parents = {key: None for key in configs}
     states = {
         key: _BucketState(limit, window) for key, (limit, window) in configs.items()
     }
@@ -119,24 +129,41 @@ def run_simulation(
     warmed = 0
     counted = 0
 
-    def evaluate(ts: float, items: list[dict[str, Any]], measure: bool) -> bool:
-        """与线上一致：任一桶超限则全部拒绝，全部通过才整体占用。
+    def evaluate(
+        ts: float,
+        direct_items: list[dict[str, Any]],
+        measure: bool,
+        touched: set[str],
+    ) -> bool:
+        """与线上一致：贡献链任一层超限则整体拒绝，全部通过才逐层占用。
 
-        measure=True 时在过期后、放行占用后各度量一次占用峰值，使区间
+        先按当前父级图把直接条目展开为贡献链（共享祖先只汇总一次），
+        每个被触及桶至多校验/占用一次（新增占用为直接+派生之和）。
+        measure=True 时在过期后、占用后各度量一次占用峰值，使区间
         起点的预热残留与被拒时刻的占用都计入模拟峰值。
         """
-        for st in (states[it["key"]] for it in items):
+        chain = tree.expand_contributions(direct_items, parents)
+        add_by_key: dict[str, int] = {}
+        for c in chain:
+            add_by_key[c["key"]] = add_by_key.get(c["key"], 0) + c["amount"]
+
+        for key in sorted(add_by_key):
+            st = states[key]
             st.expire(ts)
-            if measure and st.used > st.peak:
-                st.peak = st.used
-        denied = any(st.used + it["amount"] > st.limit for st, it in
-                     ((states[it["key"]], it) for it in items))
+            if measure:
+                touched.add(key)
+                if st.used > st.peak:
+                    st.peak = st.used
+        denied = any(
+            states[key].used + amount > states[key].limit
+            for key, amount in add_by_key.items()
+        )
         if denied:
             return False
-        for it in items:
-            st = states[it["key"]]
-            st.events.append((ts, it["amount"]))
-            st.used += it["amount"]
+        for key, amount in add_by_key.items():
+            st = states[key]
+            st.events.append((ts, amount))
+            st.used += amount
             if measure and st.used > st.peak:
                 st.peak = st.used
         return True
@@ -145,9 +172,10 @@ def run_simulation(
 
     for ts, rid, items, actual_allowed in records:
         in_range = ts >= start
+        touched: set[str] = set()
+        sim_allowed = evaluate(ts, items, in_range, touched)
         if in_range:
-            in_range_keys.update(it["key"] for it in items)
-        sim_allowed = evaluate(ts, items, in_range)
+            in_range_keys.update(touched)
         if not in_range:
             # 预热：只建立滚动窗口状态，不计统计、不计峰值、不收翻转明细
             warmed += 1

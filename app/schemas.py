@@ -28,6 +28,9 @@ class AdjustmentRequest(BaseModel):
 class BucketConfig(BaseModel):
     limit: int = Field(gt=0, le=2**31 - 1)
     window_seconds: float = Field(gt=0, le=365 * 24 * 3600)
+    # 可选父桶：省略表示不修改既有父级；显式传 null 摘除父级（成为根桶）；
+    # 传非空 key 必须指向已存在桶，且不得自引用或成环
+    parent_key: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class SimulationBucketOverride(BaseModel):

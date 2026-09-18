@@ -6,6 +6,10 @@
 ## 核心特性
 
 - **滚动窗口**：每个桶独立配置限额与窗口（秒），窗口内用量随事件过期滚动释放
+- **多级配额树**：桶可配置可选 `parent_key` 形成配额树；消费叶桶时用量**同时计入
+  全部祖先**并在同一事务内逐层校验限额，任一层超限则整链不扣减；同一次请求中
+  共享祖先的多个桶，祖先只累计**各后代金额之和**（不重复生成贡献）；
+  调整/释放按同一展开规则替换、撤销整条贡献链
 - **原子扣减**：单事务内检查 + 扣减全部桶，任一超限则整体不扣减（all-or-nothing）
 - **幂等判定**：`request_id` 首次出现时固化载荷与判定；相同内容重放原样返回
   （响应头 `X-Idempotent-Replay: true`），内容变化返回 **409**
@@ -40,19 +44,48 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ## 桶配置
 
-启动时从 `buckets.json`（可用环境变量 `QUOTA_BUCKETS_CONFIG` 替换）播种，同名桶按文件内容更新：
+启动时从 `buckets.json`（可用环境变量 `QUOTA_BUCKETS_CONFIG` 替换）播种，同名桶按文件内容更新。
+条目可携带可选 `parent_key`（指向另一个已配置桶）形成多级配额树；播种在单事务内
+校验，缺失父桶、自引用或成环则整批拒绝：
 
 ```json
 {
   "buckets": [
-    {"key": "api-requests", "limit": 100, "window_seconds": 60},
-    {"key": "llm-tokens",   "limit": 10000, "window_seconds": 60},
+    {"key": "org-quota",  "limit": 10000, "window_seconds": 60},
+    {"key": "team-quota", "limit": 1000,  "window_seconds": 60, "parent_key": "org-quota"},
+    {"key": "api-requests", "limit": 100, "window_seconds": 60, "parent_key": "team-quota"},
+    {"key": "llm-tokens",   "limit": 10000, "window_seconds": 60, "parent_key": "team-quota"},
     {"key": "heavy-jobs",   "limit": 5,   "window_seconds": 300}
   ]
 }
 ```
 
-运行时也可动态创建/更新：`PUT /v1/buckets/{key}`，请求体 `{"limit": 100, "window_seconds": 60}`。
+运行时也可动态创建/更新：`PUT /v1/buckets/{key}`，请求体
+`{"limit": 100, "window_seconds": 60, "parent_key": "team-quota"}`。
+
+`parent_key` 的更新语义（全部在单个 `BEGIN IMMEDIATE` 事务内校验）：
+
+| 传值 | 含义 | 校验 |
+| --- | --- | --- |
+| 省略该字段 | 保持既有父级不变（仅更新限额/窗口） | — |
+| `null` | 摘除父级，成为根桶 | — |
+| 非空 key | 把父级改为该桶 | 指向自身 → **409**；父桶不存在 → **404**；形成直接/间接环 → **409** |
+
+多层级配额累计规则：消费请求中的桶视为**叶桶（直接消费）**，每个叶桶沿
+`parent_key` 链上溯，把同一笔金额在**每一层祖先**各记一条派生贡献；一次请求里
+多个桶共享某祖先时，该祖先只得到一条金额为**各后代之和**的派生贡献，不重复累计。
+若某一桶既是直接目标又是另一目标桶的祖先，则其本层新增占用为"直接金额 + 派生金额"之和。
+每一层都按**自己的** `limit/window_seconds` 独立滚动校验，任一层超限则整次请求
+（叶子 + 全部祖先）都不扣减。`GET /v1/buckets/{key}/usage` 因此区分：
+
+- `direct_used`：直接消费本桶的用量；
+- `total_used`（等同保留字段 `used`）：直接用量 + 全部后代经祖先链计入的派生用量。
+
+`POST /v1/quota/releases` 撤销的是该请求当前（可能已被调整）的**整条贡献链**，
+`released_buckets`/`events_reverted` 含全部祖先层；`POST /v1/quota/adjustments`
+先排除原贡献链、再按**当前**父级关系展开并校验目标链，任一未知桶或任一层超限
+则回滚、原链完整保留，全部通过才原子替换整条链（`previous_buckets`/`buckets`
+均为含祖先的完整链，`events_replaced` 为链上事件条数）。
 
 ## 示例请求
 
@@ -208,9 +241,17 @@ curl http://localhost:8000/v1/buckets/llm-tokens/usage
 
 ```json
 {"key": "llm-tokens", "limit": 10000, "window_seconds": 60,
- "used": 500, "remaining": 9500,
+ "used": 500, "direct_used": 500, "total_used": 500, "remaining": 9500,
  "window_start": 1789657597.55, "as_of": 1789657657.55,
  "oldest_event_expires_at": 1789657717.47}
+```
+
+对挂在父桶下的叶桶，父桶用量查询会体现后代计入的派生用量，例如消费
+`llm-tokens` 500（其父为 `org-quota`）后：
+
+```json
+{"key": "org-quota", "limit": 10000, "window_seconds": 60,
+ "used": 500, "direct_used": 0, "total_used": 500, "remaining": 9500, ...}
 ```
 
 ### 6. 哈希审计链
@@ -290,6 +331,9 @@ curl http://localhost:8000/v1/audit/verify
   预热区间内的历史消费只建立滚动窗口状态，**不计统计**；
 - 回放：按 `(created_at, request_id)` 稳定顺序读取 `requests` 表中
   **首次消费**固化的载荷，重算滚动过期与多桶"全放行 / 全拒绝"；
+  贡献链按**当前** `parent_key` 关系展开（叶桶占用 + 全部祖先派生占用，
+  共享祖先只汇总一次），任一层限额（可由候选覆盖）翻转即记为判定翻转，
+  `bucket_peaks` 含被触及的各祖先桶；
   只回放消费（放行才占额度、拒绝不占），**不处理 release**；
 - 非法范围、跨度超过 **7 天**、候选引用未知桶或同一桶重复 → **422**。
 
@@ -360,8 +404,8 @@ curl -X POST http://localhost:8000/v1/quota/simulations \
 | `POST` | `/v1/quota/releases` | 释放一次已放行消费；`200` 成功或重放 / `409` 冲突 / `404` 原请求不存在 |
 | `POST` | `/v1/quota/adjustments` | 原子替换一次已放行且未释放消费的桶贡献；`200` 成功或重放 / `429` 目标超限（原贡献保留） / `409` 幂等冲突或请求不可调整 / `404` 原请求或目标桶不存在 |
 | `POST` | `/v1/quota/simulations` | 隔离内存回放历史消费评估候选配置；`200` 试算结果 / `422` 未知桶、非法范围或跨度超 7 天 |
-| `GET` | `/v1/buckets/{key}/usage` | 查询桶当前滚动窗口用量 |
-| `PUT` | `/v1/buckets/{key}` | 创建或更新桶（`limit`、`window_seconds`） |
+| `GET` | `/v1/buckets/{key}/usage` | 查询桶当前滚动窗口用量（`direct_used` / `total_used`） |
+| `PUT` | `/v1/buckets/{key}` | 创建或更新桶（`limit`、`window_seconds`、可选 `parent_key`）；自引用 409 / 缺失父桶 404 / 成环 409 |
 | `GET` | `/v1/buckets` | 列出全部桶配置 |
 | `GET` | `/v1/audit?after_seq=&limit=` | 按 `seq` 升序返回审计记录与链头 |
 | `GET` | `/v1/audit/verify` | 全链重算，返回 `valid`/`checked_count`/`head_hash`/`first_invalid_seq` |
@@ -412,6 +456,17 @@ curl -X POST http://localhost:8000/v1/quota/simulations \
   的创世前序哈希起逐条重算，同时核对 `seq` 连续性，报告首个失配位置。
 - **最早重试时间**：按窗口内事件过期时刻累计释放量，找到最早可容纳本次请求的过期点；
   多桶受限时取各桶的最大值。
+- **多级配额树**：`buckets.parent_key` 自引用（外键指向同表），`usage_events.is_direct`
+  区分直接事件（`1`，叶桶自身）与派生事件（`0`，由祖先链计入）。消费/调整在事务内
+  读取全量父级图，用 `app/tree.py` 的 `expand_contributions` 把直接条目展开为贡献链：
+  每个叶桶沿父链上溯逐桶累加，共享祖先只得到一条金额为后代之和的派生事件（同桶直接
+  与派生分别保留两条事件，容量校验按两者之和）。每一层独立执行"滚动窗口求和（直接+
+  派生）→ 限额比较"，任一层超限即整体回滚，限额与重试时间均按该层自己的窗口计算。
+  释放/调整以 `request_id` 删除/重写其**全部**事件即等价于撤销/替换整条贡献链，
+  故层级展开不改变既有幂等、占用与审计语义。`PUT /v1/buckets/{key}` 在写入前于事务
+  内构建"假设替换"后的父级图并沿链上溯，自引用/重新回到自身（任何直接或间接环）
+  返回 409、父桶缺失返回 404；省略 `parent_key` 保持原值、显式 `null` 摘除父级。
+  旧库通过增量迁移补列，历史用量事件默认 `is_direct=1`，与既有平级桶行为完全一致。
 - **回放模拟**：`simulations` 全程只读、不开写事务，从 `requests` 表取出
   `[from - max_window, to)` 内首次消费固化的 `(created_at, request_id, payload,
   allowed)`，按 `(created_at, request_id)` 升序送入 `app/simulation.py` 的纯函数
@@ -441,4 +496,11 @@ python -m pytest tests/ -q
 分页与链头、全链校验有效与篡改检出（事件内容/前序指针），以及回放模拟的四类转移
 计数、候选覆盖与沿用当前配置、窗口收缩导致的 deny→allow、多桶全拒不占用、
 预热边界与峰值、release 不回放、稳定顺序与 100 条截断、只读不留痕、
-422 校验分支与已删除桶陈旧载荷，共 71 个用例。
+422 校验分支与已删除桶陈旧载荷；多级配额树额外覆盖祖先链逐层累计与
+`direct_used/total_used`、根/中间层限额拦截整链不扣减、共享祖先只汇总后代
+金额一次（事件层断言）、同桶直接+派生相加、释放/调整按同一展开规则撤销与
+替换整条贡献链（调整后释放撤销新链、祖先超限 429 回滚保留原链）、父级更新的
+自引用 409/缺失父桶 404/间接环 409 事务保护、合法改挂与显式摘除、省略字段
+保持父级、分层窗口独立过期、幂等重放不重新累计、50 并发不突破根限额、层级
+模拟贡献链展开与祖先限额翻转、播种父先子后及非法图整批回滚，以及
+`app/tree.py` 展开/环检测纯函数，共 96 个用例。

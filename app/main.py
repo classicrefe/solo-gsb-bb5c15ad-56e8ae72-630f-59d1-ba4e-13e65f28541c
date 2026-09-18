@@ -14,6 +14,11 @@
   调整在原事务追加一条审计记录，同 adjustment_id 同载荷重放原样
   返回、改换载荷返回 409；
 - 释放撤销的是该请求当前（可能已被调整）的用量贡献。
+
+桶可配置可选 ``parent_key`` 形成多级配额树：消费叶桶时用量同时计入其
+全部祖先并原子校验每一层限额（任一层超限整体不扣减）；同一请求中共享
+祖先的多个桶，祖先只累计各后代金额之和；调整/释放按同一展开规则替换、
+撤销整条贡献链。
 """
 from __future__ import annotations
 
@@ -28,7 +33,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-from . import audit, config, simulation
+from . import audit, config, simulation, tree
 from .db import _rollback_quietly, connect, init_db, seed_buckets
 from .quota import earliest_retry_at, merge_items, payload_hash
 from .schemas import (
@@ -133,75 +138,168 @@ def consume(req: ConsumeRequest):
     return _decision_response(decision, replayed)
 
 
-def _evaluate_and_consume(
-    conn: sqlite3.Connection, request_id: str, items: list[dict], now: float
-) -> dict:
-    """在事务内检查全部桶；全部通过才写入扣减事件。"""
+def _load_bucket_map(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:
+    """读取全部桶配置（含 parent_key），供祖先链展开使用。"""
+    return {
+        r["key"]: r
+        for r in conn.execute(
+            "SELECT key, limit_amount, window_seconds, parent_key FROM buckets"
+        )
+    }
+
+
+def _window_events(
+    conn: sqlite3.Connection, key: str, window: float, now: float
+) -> list[tuple[float, int]]:
+    """桶当前滚动窗口内 (created_at, amount) 事件（直接 + 派生合计即总用量）。"""
+    return [
+        (r["created_at"], r["amount"])
+        for r in conn.execute(
+            "SELECT created_at, amount FROM usage_events "
+            "WHERE bucket_key = ? AND created_at > ? ORDER BY created_at",
+            (key, now - window),
+        )
+    ]
+
+
+def _check_chain(
+    conn: sqlite3.Connection,
+    chain: list[dict],
+    bucket_map: dict[str, sqlite3.Row],
+    now: float,
+) -> list[dict]:
+    """对贡献链涉及的每一层逐桶做滚动窗口容量校验，返回受限桶列表。
+
+    chain 中同一桶至多两条（is_direct 直接 / 派生汇总），新增占用为
+    各条 amount 之和；窗口用量为现存事件总和（直接 + 派生），故
+    direct_used / total_used 在每一层都被原子校验。
+    """
+    # 合并同桶新增占用（保留直接/派生明细供用量分解）
+    add_by_key: dict[str, int] = {}
+    for c in chain:
+        add_by_key[c["key"]] = add_by_key.get(c["key"], 0) + c["amount"]
+
     limited: list[dict] = []
-
-    for item in items:
-        bucket = conn.execute(
-            "SELECT limit_amount, window_seconds FROM buckets WHERE key = ?",
-            (item["key"],),
-        ).fetchone()
-        if bucket is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"桶 '{item['key']}' 未配置，请先通过 PUT /v1/buckets/{item['key']} 创建",
-            )
-
+    for key in sorted(add_by_key):
+        bucket = bucket_map[key]
         limit = bucket["limit_amount"]
         window = bucket["window_seconds"]
-        events = [
-            (r["created_at"], r["amount"])
-            for r in conn.execute(
-                "SELECT created_at, amount FROM usage_events "
-                "WHERE bucket_key = ? AND created_at > ? ORDER BY created_at",
-                (item["key"], now - window),
-            )
-        ]
+        events = _window_events(conn, key, window, now)
         used = sum(a for _, a in events)
+        requested = add_by_key[key]
 
-        if used + item["amount"] > limit:
-            retry_at = earliest_retry_at(events, limit, window, item["amount"], now)
+        if used + requested > limit:
+            retry_at = earliest_retry_at(events, limit, window, requested, now)
             limited.append(
                 {
-                    "key": item["key"],
+                    "key": key,
                     "limit": limit,
                     "window_seconds": window,
                     "used": used,
-                    "requested": item["amount"],
+                    "requested": requested,
                     "retry_at": retry_at,
                     "retry_after_seconds": (
                         None if retry_at is None else max(0.0, retry_at - now)
                     ),
                 }
             )
+    return limited
+
+
+def _limited_decision(
+    *,
+    limited: list[dict],
+    now: float,
+    request_id: str | None = None,
+    adjustment_id: str | None = None,
+    extra: dict | None = None,
+) -> dict:
+    """构造受限（429）判定体：多桶受限时整体重试时间取各桶最大值。"""
+    retry_times = [b["retry_at"] for b in limited]
+    overall_retry_at = (
+        max(retry_times) if all(t is not None for t in retry_times) else None
+    )
+    body: dict = {
+        "allowed": False,
+        "limited_buckets": limited,
+        "retry_at": overall_retry_at,
+        "retry_after_seconds": (
+            None if overall_retry_at is None
+            else max(0.0, overall_retry_at - now)
+        ),
+        "decided_at": now,
+    }
+    if request_id is not None:
+        body["request_id"] = request_id
+    if adjustment_id is not None:
+        # 调整的 429 响应以 adjusted 字段标识（与 200 调整响应对齐）
+        body["adjusted"] = False
+        body["adjustment_id"] = adjustment_id
+    if extra:
+        body.update(extra)
+    return body
+
+
+def _insert_chain_events(
+    conn: sqlite3.Connection,
+    chain: list[dict],
+    request_id: str,
+    created_at: float,
+) -> None:
+    """按贡献链写入用量事件（每桶至多直接/派生各一条）。"""
+    for c in chain:
+        conn.execute(
+            "INSERT INTO usage_events "
+            "(bucket_key, request_id, amount, created_at, is_direct) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                c["key"],
+                request_id,
+                c["amount"],
+                created_at,
+                1 if c["is_direct"] else 0,
+            ),
+        )
+
+
+def _request_contribution_chain(
+    conn: sqlite3.Connection, request_id: str
+) -> list[dict]:
+    """汇总请求现存用量事件为规范化贡献链（同桶直接/派生金额合并）。"""
+    return merge_items(
+        [
+            {"key": r["bucket_key"], "amount": r["amount"]}
+            for r in conn.execute(
+                "SELECT bucket_key, amount FROM usage_events WHERE request_id = ?",
+                (request_id,),
+            ).fetchall()
+        ]
+    )
+
+
+def _evaluate_and_consume(
+    conn: sqlite3.Connection, request_id: str, items: list[dict], now: float
+) -> dict:
+    """在事务内检查贡献链全部层级；全部通过才写入整条扣减事件。"""
+    bucket_map = _load_bucket_map(conn)
+    missing = [it["key"] for it in items if it["key"] not in bucket_map]
+    if missing:
+        key = missing[0]
+        raise HTTPException(
+            status_code=404,
+            detail=f"桶 '{key}' 未配置，请先通过 PUT /v1/buckets/{key} 创建",
+        )
+
+    parents = {k: b["parent_key"] for k, b in bucket_map.items()}
+    chain = tree.expand_contributions(items, parents)
+    limited = _check_chain(conn, chain, bucket_map, now)
 
     if limited:
-        # 任一超限：全部不扣减；整体最早重试时间取各受限桶的最大值
-        retry_times = [b["retry_at"] for b in limited]
-        overall_retry_at = (
-            max(retry_times) if all(t is not None for t in retry_times) else None
-        )
-        return {
-            "request_id": request_id,
-            "allowed": False,
-            "limited_buckets": limited,
-            "retry_at": overall_retry_at,
-            "retry_after_seconds": (
-                None if overall_retry_at is None else max(0.0, overall_retry_at - now)
-            ),
-            "decided_at": now,
-        }
+        # 任一层超限：整条链都不扣减
+        return _limited_decision(request_id=request_id, limited=limited, now=now)
 
-    # 全部通过：同事务写入所有桶的扣减事件
-    for item in items:
-        conn.execute(
-            "INSERT INTO usage_events (bucket_key, request_id, amount, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (item["key"], request_id, item["amount"], now),
-        )
+    # 全部通过：同事务写入叶桶直接事件与全部祖先派生事件
+    _insert_chain_events(conn, chain, request_id, now)
     return {
         "request_id": request_id,
         "allowed": True,
@@ -325,15 +423,10 @@ def _release_consumption(
             ),
         )
 
-    # 撤销该请求当前对所有桶的用量贡献：经调整后贡献来自替换写入的事件，
-    # 故以现存事件为准（调整发生在释放之前，事件与当前贡献一一对应）
-    current = [
-        {"key": r["bucket_key"], "amount": r["amount"]}
-        for r in conn.execute(
-            "SELECT bucket_key, amount FROM usage_events WHERE request_id = ?",
-            (request_id,),
-        ).fetchall()
-    ]
+    # 撤销该请求当前的整条贡献链（叶桶直接事件 + 祖先派生事件）：
+    # 经调整后贡献来自替换写入的事件，故以现存事件为准（调整发生在释放
+    # 之前，事件与当前贡献一一对应），按桶汇总各直接/派生金额
+    current = _request_contribution_chain(conn, request_id)
     deleted = conn.execute(
         "DELETE FROM usage_events WHERE request_id = ?",
         (request_id,),
@@ -353,7 +446,7 @@ def _release_consumption(
         "release_id": release_id,
         "request_id": request_id,
         "released": True,
-        "released_buckets": merge_items(current),
+        "released_buckets": current,
         "events_reverted": deleted,
         "released_at": now,
     }
@@ -469,7 +562,7 @@ def _evaluate_and_adjust(
     items: list[dict],
     now: float,
 ) -> dict:
-    """事务内排除原贡献后校验目标列表；全部通过才原子替换全部用量事件。"""
+    """事务内排除原贡献链后校验目标链；全部通过才原子替换整条贡献链。"""
     row = conn.execute(
         "SELECT allowed, release_id, created_at FROM requests WHERE request_id = ?",
         (request_id,),
@@ -489,102 +582,54 @@ def _evaluate_and_adjust(
             status_code=409,
             detail=(
                 f"消费请求 '{request_id}' 已被 release_id '{row['release_id']}' 释放，"
-                "用量贡献已撤销，不可调整"
+                "用量贡献链已撤销，不可调整"
             ),
         )
 
-    # 先从窗口用量中排除该请求的原贡献（当前现存事件；调整为替换语义，
-    # 同一 request_id 至多存在一套事件）
-    old_rows = conn.execute(
-        "SELECT bucket_key, amount FROM usage_events WHERE request_id = ?",
-        (request_id,),
-    ).fetchall()
-    previous = merge_items(
-        [{"key": r["bucket_key"], "amount": r["amount"]} for r in old_rows]
-    )
+    # 先从窗口用量中排除该请求的原贡献链（当前现存事件；调整为替换语义，
+    # 同一 request_id 至多存在一套事件，含直接与全部祖先派生事件）
+    previous = _request_contribution_chain(conn, request_id)
     conn.execute("DELETE FROM usage_events WHERE request_id = ?", (request_id,))
 
-    # 再按当前桶配置校验目标列表（此刻窗口用量已不含本请求的原贡献）
-    limited: list[dict] = []
-    for item in items:
-        bucket = conn.execute(
-            "SELECT limit_amount, window_seconds FROM buckets WHERE key = ?",
-            (item["key"],),
-        ).fetchone()
-        if bucket is None:
-            raise HTTPException(
-                status_code=404,
-                detail=(
-                    f"目标桶 '{item['key']}' 未配置，请先通过 "
-                    f"PUT /v1/buckets/{item['key']} 创建"
-                ),
-            )
+    # 再按当前桶配置展开并校验目标贡献链（此刻窗口用量已不含本请求原贡献）
+    bucket_map = _load_bucket_map(conn)
+    missing = [it["key"] for it in items if it["key"] not in bucket_map]
+    if missing:
+        key = missing[0]
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"目标桶 '{key}' 未配置，请先通过 PUT /v1/buckets/{key} 创建"
+            ),
+        )
 
-        limit = bucket["limit_amount"]
-        window = bucket["window_seconds"]
-        events = [
-            (r["created_at"], r["amount"])
-            for r in conn.execute(
-                "SELECT created_at, amount FROM usage_events "
-                "WHERE bucket_key = ? AND created_at > ? ORDER BY created_at",
-                (item["key"], now - window),
-            )
-        ]
-        used = sum(a for _, a in events)
-
-        if used + item["amount"] > limit:
-            retry_at = earliest_retry_at(events, limit, window, item["amount"], now)
-            limited.append(
-                {
-                    "key": item["key"],
-                    "limit": limit,
-                    "window_seconds": window,
-                    "used": used,
-                    "requested": item["amount"],
-                    "retry_at": retry_at,
-                    "retry_after_seconds": (
-                        None if retry_at is None else max(0.0, retry_at - now)
-                    ),
-                }
-            )
+    parents = {k: b["parent_key"] for k, b in bucket_map.items()}
+    chain = tree.expand_contributions(items, parents)
+    limited = _check_chain(conn, chain, bucket_map, now)
 
     if limited:
-        # 任一超限：不写入替换事件；事务回滚后已删除的原贡献原样恢复
-        retry_times = [b["retry_at"] for b in limited]
-        overall_retry_at = (
-            max(retry_times) if all(t is not None for t in retry_times) else None
+        # 任一层超限：不写入替换事件；事务回滚后已删除的原贡献链原样恢复
+        return _limited_decision(
+            adjustment_id=adjustment_id,
+            limited=limited,
+            now=now,
+            extra={
+                "previous_buckets": previous,
+                "target_buckets": items,
+            },
         )
-        return {
-            "adjustment_id": adjustment_id,
-            "request_id": request_id,
-            "adjusted": False,
-            "previous_buckets": previous,
-            "target_buckets": items,
-            "limited_buckets": limited,
-            "retry_at": overall_retry_at,
-            "retry_after_seconds": (
-                None if overall_retry_at is None
-                else max(0.0, overall_retry_at - now)
-            ),
-            "decided_at": now,
-        }
 
-    # 全部通过：原子替换为目标桶事件。沿用原消费的 created_at，使新贡献与
-    # 原贡献在同一滚动窗口时刻生效（与首次扣减事件一一替换）
+    # 全部通过：按同一展开规则原子替换整条贡献链。沿用原消费 created_at，
+    # 使新贡献与原贡献在同一滚动窗口时刻生效
     created_at = row["created_at"]
-    for item in items:
-        conn.execute(
-            "INSERT INTO usage_events (bucket_key, request_id, amount, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (item["key"], request_id, item["amount"], created_at),
-        )
+    _insert_chain_events(conn, chain, request_id, created_at)
     return {
         "adjustment_id": adjustment_id,
         "request_id": request_id,
         "adjusted": True,
         "previous_buckets": previous,
-        "buckets": items,
-        "events_replaced": len(items),
+        "buckets": _request_contribution_chain(conn, request_id),
+        "events_replaced": len(chain),
         "adjusted_at": now,
     }
 
@@ -616,11 +661,12 @@ def simulate_quota(req: SimulationRequest):
     conn = connect()
     try:
         rows = conn.execute(
-            "SELECT key, limit_amount, window_seconds FROM buckets"
+            "SELECT key, limit_amount, window_seconds, parent_key FROM buckets"
         ).fetchall()
         db_configs = {
             r["key"]: (r["limit_amount"], float(r["window_seconds"])) for r in rows
         }
+        parents = {r["key"]: r["parent_key"] for r in rows}
         overrides = [o.model_dump() for o in req.buckets]
         try:
             override_cfg = simulation.validate_request(
@@ -659,7 +705,9 @@ def simulate_quota(req: SimulationRequest):
             )
         records.append((r["created_at"], r["request_id"], items,
                         bool(r["allowed"])))
-    result = simulation.run_simulation(records, effective, float(req.from_))
+    result = simulation.run_simulation(
+        records, effective, float(req.from_), parents
+    )
 
     return {
         "from": req.from_,
@@ -721,19 +769,65 @@ def verify_audit():
 
 @app.put("/v1/buckets/{key}", status_code=200)
 def upsert_bucket(key: str, cfg: BucketConfig):
-    """创建或更新桶的限额与窗口。"""
+    """创建或更新桶的限额、窗口与可选父级。
+
+    ``parent_key`` 省略（字段不在请求体）时保持既有父级；显式传
+    ``null`` 摘除父级；传非空 key 则必须指向已存在桶。更新父级在单个
+    ``BEGIN IMMEDIATE`` 事务内拒绝自引用、缺失父桶与任何直接/间接环。
+    """
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT parent_key FROM buckets WHERE key = ?", (key,)
+        ).fetchone()
+        parent = cfg.parent_key
+        if cfg.model_fields_set.isdisjoint({"parent_key"}) and existing is not None:
+            # 省略 parent_key：保持原值（创建场景默认 NULL 根桶）
+            parent = existing["parent_key"]
+
+        if parent is not None:
+            if parent == key:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"桶 '{key}' 的 parent_key 不能指向自身",
+                )
+            parent_row = conn.execute(
+                "SELECT 1 FROM buckets WHERE key = ?", (parent,)
+            ).fetchone()
+            if parent_row is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"父桶 '{parent}' 未配置，请先通过 "
+                        f"PUT /v1/buckets/{parent} 创建"
+                    ),
+                )
+            parents = {
+                r["key"]: r["parent_key"]
+                for r in conn.execute("SELECT key, parent_key FROM buckets")
+            }
+            # 在"假设替换"后的父级图上沿链检查：若重新回到 key 即成环
+            parents[key] = parent
+            if tree.find_cycle(key, parent, parents):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"将桶 '{key}' 的父级设为 '{parent}' 会形成配额环，"
+                        "父级链不允许自引用或循环"
+                    ),
+                )
+
         conn.execute(
             """
-            INSERT INTO buckets (key, limit_amount, window_seconds)
-            VALUES (?, ?, ?)
+            INSERT INTO buckets (key, limit_amount, window_seconds, parent_key)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT (key) DO UPDATE SET
                 limit_amount   = excluded.limit_amount,
-                window_seconds = excluded.window_seconds
+                window_seconds = excluded.window_seconds,
+                parent_key     = excluded.parent_key
             """,
-            (key, cfg.limit, cfg.window_seconds),
+            (key, cfg.limit, cfg.window_seconds, parent),
         )
         conn.execute("COMMIT")
     except Exception:
@@ -741,7 +835,12 @@ def upsert_bucket(key: str, cfg: BucketConfig):
         raise
     finally:
         conn.close()
-    return {"key": key, "limit": cfg.limit, "window_seconds": cfg.window_seconds}
+    return {
+        "key": key,
+        "limit": cfg.limit,
+        "window_seconds": cfg.window_seconds,
+        "parent_key": parent,
+    }
 
 
 @app.get("/v1/buckets")
@@ -749,13 +848,19 @@ def list_buckets():
     conn = connect()
     try:
         rows = conn.execute(
-            "SELECT key, limit_amount, window_seconds FROM buckets ORDER BY key"
+            "SELECT key, limit_amount, window_seconds, parent_key "
+            "FROM buckets ORDER BY key"
         ).fetchall()
     finally:
         conn.close()
     return {
         "buckets": [
-            {"key": r["key"], "limit": r["limit_amount"], "window_seconds": r["window_seconds"]}
+            {
+                "key": r["key"],
+                "limit": r["limit_amount"],
+                "window_seconds": r["window_seconds"],
+                "parent_key": r["parent_key"],
+            }
             for r in rows
         ]
     }
@@ -763,32 +868,41 @@ def list_buckets():
 
 @app.get("/v1/buckets/{key}/usage")
 def bucket_usage(key: str):
-    """查询桶当前滚动窗口用量。"""
+    """查询桶当前滚动窗口用量。
+
+    - direct_used：直接消费本桶的用量（is_direct=1）；
+    - total_used：本桶总用量（直接 + 全部后代经祖先链计入的派生用量）；
+    - used：保留字段，等同 total_used。
+    """
     now = time.time()
     conn = connect()
     try:
         bucket = conn.execute(
-            "SELECT limit_amount, window_seconds FROM buckets WHERE key = ?", (key,)
+            "SELECT limit_amount, window_seconds FROM buckets WHERE key = ?",
+            (key,),
         ).fetchone()
         if bucket is None:
             raise HTTPException(status_code=404, detail=f"桶 '{key}' 未配置")
         window = bucket["window_seconds"]
         events = conn.execute(
-            "SELECT created_at, amount FROM usage_events "
+            "SELECT created_at, amount, is_direct FROM usage_events "
             "WHERE bucket_key = ? AND created_at > ? ORDER BY created_at",
             (key, now - window),
         ).fetchall()
     finally:
         conn.close()
 
-    used = sum(r["amount"] for r in events)
+    direct_used = sum(r["amount"] for r in events if r["is_direct"])
+    total_used = sum(r["amount"] for r in events)
     oldest = events[0]["created_at"] if events else None
     return {
         "key": key,
         "limit": bucket["limit_amount"],
         "window_seconds": window,
-        "used": used,
-        "remaining": max(0, bucket["limit_amount"] - used),
+        "used": total_used,
+        "direct_used": direct_used,
+        "total_used": total_used,
+        "remaining": max(0, bucket["limit_amount"] - total_used),
         "window_start": now - window,
         "as_of": now,
         "oldest_event_expires_at": None if oldest is None else oldest + window,
