@@ -28,6 +28,11 @@ class AdjustmentRequest(BaseModel):
 class BucketConfig(BaseModel):
     limit: int = Field(gt=0, le=2**31 - 1)
     window_seconds: float = Field(gt=0, le=365 * 24 * 3600)
+    # 可选父桶：省略或显式 null 都表示根桶（PUT 为整体替换语义，
+    # 未携带即清空父级）；非空时在事务内校验存在性与无环
+    parent_key: str | None = Field(
+        default=None, min_length=1, max_length=128
+    )
 
 
 class SimulationBucketOverride(BaseModel):

@@ -6,6 +6,9 @@
 
 - 滚动窗口过期与"多桶全放行/全拒绝"规则与线上 ``consume`` 完全一致，
   但所有状态只保存在本模块的内存结构中；
+- 配额树规则与线上一致：消费叶桶时沿 ``parents`` 父链向全部祖先汇总
+  用量并逐层校验限额，共享祖先的多个后代只累计金额之和（见
+  ``app.quota.expand_contributions``）；
 - 只回放消费（放行才占额度，拒绝不占），不处理 release——即回放的是
   "首次消费判定形成的原始用量流"，释放在模拟中忽略；
 - ``start`` 之前再取各桶生效窗口的最大值作为预热期，预热记录只建立
@@ -17,6 +20,8 @@ from __future__ import annotations
 
 from collections import deque
 from typing import Any, Deque
+
+from .quota import expand_contributions
 
 # 判定翻转明细最多返回条数
 FLIP_DETAIL_LIMIT = 100
@@ -96,6 +101,7 @@ def run_simulation(
     records: list[tuple[float, str, list[dict[str, Any]], bool]],
     configs: dict[str, tuple[int, float]],
     start: float,
+    parents: dict[str, str | None] | None = None,
 ) -> dict[str, Any]:
     """在隔离内存中回放首次消费载荷并重算判定。
 
@@ -104,7 +110,10 @@ def run_simulation(
         ``(created_at, request_id)`` 升序排列，且时间覆盖预热起点。
     :param configs: 全部已配置桶的生效 ``{key: (limit, window)}``。
     :param start: 统计区间起点（epoch 秒）；``created_at < start`` 仅预热。
+    :param parents: 配额树父子映射（根桶值为 None）；None 视为全根桶，
+        退化为无祖先汇总的扁平行为。
     """
+    parents = parents or {}
     states = {
         key: _BucketState(limit, window) for key, (limit, window) in configs.items()
     }
@@ -120,23 +129,29 @@ def run_simulation(
     counted = 0
 
     def evaluate(ts: float, items: list[dict[str, Any]], measure: bool) -> bool:
-        """与线上一致：任一桶超限则全部拒绝，全部通过才整体占用。
+        """与线上一致：直接桶 + 全部祖先任一层超限则整体拒绝，全部通过
+        才按贡献链整体占用（直接事件 + 每祖先一条汇总事件）。
 
         measure=True 时在过期后、放行占用后各度量一次占用峰值，使区间
         起点的预热残留与被拒时刻的占用都计入模拟峰值。
         """
-        for st in (states[it["key"]] for it in items):
+        contributions = expand_contributions(items, parents)
+        affected = list(contributions)
+        for bk in affected:
+            st = states[bk]
             st.expire(ts)
             if measure and st.used > st.peak:
                 st.peak = st.used
-        denied = any(st.used + it["amount"] > st.limit for st, it in
-                     ((states[it["key"]], it) for it in items))
+        denied = any(
+            states[bk].used + parts["total"] > states[bk].limit
+            for bk, parts in contributions.items()
+        )
         if denied:
             return False
-        for it in items:
-            st = states[it["key"]]
-            st.events.append((ts, it["amount"]))
-            st.used += it["amount"]
+        for bk, parts in contributions.items():
+            st = states[bk]
+            st.events.append((ts, parts["total"]))
+            st.used += parts["total"]
             if measure and st.used > st.peak:
                 st.peak = st.used
         return True
@@ -146,7 +161,8 @@ def run_simulation(
     for ts, rid, items, actual_allowed in records:
         in_range = ts >= start
         if in_range:
-            in_range_keys.update(it["key"] for it in items)
+            # 峰值统计覆盖该请求贡献链上的全部桶（直接桶 + 祖先）
+            in_range_keys.update(expand_contributions(items, parents))
         sim_allowed = evaluate(ts, items, in_range)
         if not in_range:
             # 预热：只建立滚动窗口状态，不计统计、不计峰值、不收翻转明细
@@ -172,7 +188,7 @@ def run_simulation(
                 }
             )
 
-    # 仅回放在统计区间回放载荷中出现过的桶，按 key 稳定输出
+    # 仅回放在统计区间回放载荷贡献链上出现过的桶，按 key 稳定输出
     peaks = {
         key: states[key].peak
         for key in sorted(in_range_keys)

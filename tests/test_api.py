@@ -1531,3 +1531,512 @@ def test_simulation_stale_payload_unknown_bucket_422():
     assert r.status_code == 422
     assert ghost in r.json()["detail"]
     assert client.get("/v1/audit/verify").json()["checked_count"] == before
+
+
+# ---------------------------------------------------------------- 多级配额树
+
+def _put_bucket(key: str, limit: int, window: float = 60.0,
+                parent_key: str | None = None):
+    body = {"limit": limit, "window_seconds": window}
+    if parent_key is not None:
+        body["parent_key"] = parent_key
+    r = client.put(f"/v1/buckets/{key}", json=body)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _tree3(root_limit=1000, mid_limit=1000, leaf_limit=1000):
+    """创建 root -> mid -> leaf 三级配额树，返回三个桶键。"""
+    root = f"t-root-{_rid()[:10]}"
+    mid = f"t-mid-{_rid()[:10]}"
+    leaf = f"t-leaf-{_rid()[:10]}"
+    _put_bucket(root, root_limit)
+    _put_bucket(mid, mid_limit, parent_key=root)
+    _put_bucket(leaf, leaf_limit, parent_key=mid)
+    return root, mid, leaf
+
+
+def _consume_multi(rid: str, items: list[tuple[str, int]]):
+    return client.post("/v1/quota/consume", json={
+        "request_id": rid,
+        "buckets": [{"key": k, "amount": a} for k, a in items],
+    })
+
+
+def test_quota_tree_pure_expand_contributions():
+    """expand_contributions：叶桶消费展开到全部祖先；共享祖先只汇总一次。"""
+    from app.quota import ancestor_chain, expand_contributions
+
+    parents = {"r": None, "m": "r", "a": "m", "b": "m"}
+    assert ancestor_chain("a", parents) == ["m", "r"]
+    assert ancestor_chain("r", parents) == []
+
+    # 单叶：自身 direct，m/r 各 rollup
+    c = expand_contributions([{"key": "a", "amount": 3}], parents)
+    assert c == {
+        "a": {"direct": 3, "rollup": 0, "total": 3},
+        "m": {"direct": 0, "rollup": 3, "total": 3},
+        "r": {"direct": 0, "rollup": 3, "total": 3},
+    }
+
+    # 共享祖先的两个后代：祖先只累计金额之和（3+2=5），不重复
+    c = expand_contributions(
+        [{"key": "a", "amount": 3}, {"key": "b", "amount": 2}], parents
+    )
+    assert c["r"] == {"direct": 0, "rollup": 5, "total": 5}
+    assert c["m"] == {"direct": 0, "rollup": 5, "total": 5}
+    assert c["a"] == {"direct": 3, "rollup": 0, "total": 3}
+    assert c["b"] == {"direct": 2, "rollup": 0, "total": 2}
+
+    # 同桶重复条目先经 merge_items 合并；直接点名内部桶时 direct 与
+    # rollup 并存
+    c = expand_contributions(
+        [{"key": "a", "amount": 3}, {"key": "m", "amount": 4}], parents
+    )
+    assert c["m"] == {"direct": 4, "rollup": 3, "total": 7}
+    assert c["r"] == {"direct": 0, "rollup": 7, "total": 7}
+
+
+def test_bucket_put_accepts_and_returns_parent_key():
+    """PUT 可创建带 parent_key 的桶；GET 列表与响应都带回 parent_key。"""
+    root = f"p-root-{_rid()[:10]}"
+    child = f"p-child-{_rid()[:10]}"
+    body = _put_bucket(root, 10)
+    assert body["parent_key"] is None
+    body = _put_bucket(child, 5, parent_key=root)
+    assert body["parent_key"] == root
+
+    listing = {b["key"]: b for b in client.get("/v1/buckets").json()["buckets"]}
+    assert listing[root]["parent_key"] is None
+    assert listing[child]["parent_key"] == root
+
+    # 省略 parent_key（或显式 null）= 根桶
+    r = client.put(f"/v1/buckets/{child}", json={"limit": 5, "window_seconds": 60})
+    assert r.status_code == 200 and r.json()["parent_key"] is None
+    r = client.put(f"/v1/buckets/{child}",
+                   json={"limit": 5, "window_seconds": 60, "parent_key": None})
+    assert r.status_code == 200 and r.json()["parent_key"] is None
+    # 重新挂回
+    assert _put_bucket(child, 5, parent_key=root)["parent_key"] == root
+
+
+def test_bucket_parent_self_reference_rejected_in_transaction():
+    """parent_key 指向自身 → 422，配置不发生任何变化。"""
+    key = f"self-{_rid()[:10]}"
+    _put_bucket(key, 10)
+    r = client.put(f"/v1/buckets/{key}",
+                   json={"limit": 99, "window_seconds": 60, "parent_key": key})
+    assert r.status_code == 422
+    assert key in r.json()["detail"]
+    # 限额/窗口/父级均未被部分更新（事务回滚）
+    u = client.get(f"/v1/buckets/{key}/usage").json()
+    assert u["limit"] == 10
+    listing = {b["key"]: b for b in client.get("/v1/buckets").json()["buckets"]}
+    assert listing[key]["parent_key"] is None
+
+
+def test_bucket_parent_missing_rejected():
+    """parent_key 指向不存在的桶 → 422（创建与更新均拒绝）。"""
+    key = f"miss-{_rid()[:10]}"
+    ghost = f"ghost-{_rid()[:10]}"
+    r = client.put(f"/v1/buckets/{key}",
+                   json={"limit": 10, "window_seconds": 60, "parent_key": ghost})
+    assert r.status_code == 422
+    assert ghost in r.json()["detail"]
+    # 桶未被创建
+    assert client.get(f"/v1/buckets/{key}/usage").status_code == 404
+
+    _put_bucket(key, 10)
+    r = client.put(f"/v1/buckets/{key}",
+                   json={"limit": 10, "window_seconds": 60, "parent_key": ghost})
+    assert r.status_code == 422
+
+
+def test_bucket_parent_indirect_cycle_rejected():
+    """任何直接或间接环都在事务内拒绝，整棵树保持原状。"""
+    root, mid, leaf = _tree3()
+    # root 挂到 leaf -> root-mid-leaf-root 间接环
+    r = client.put(f"/v1/buckets/{root}",
+                   json={"limit": 1000, "window_seconds": 60, "parent_key": leaf})
+    assert r.status_code == 422
+    # mid 挂到自己的后代 leaf
+    r = client.put(f"/v1/buckets/{mid}",
+                   json={"limit": 1000, "window_seconds": 60, "parent_key": leaf})
+    assert r.status_code == 422
+    listing = {b["key"]: b["parent_key"]
+               for b in client.get("/v1/buckets").json()["buckets"]}
+    assert listing[root] is None
+    assert listing[mid] == root
+    assert listing[leaf] == mid
+
+    # 合法的重新挂接（leaf 改挂 root）成功
+    assert _put_bucket(leaf, 1000, parent_key=root)["parent_key"] == root
+
+
+def test_leaf_consume_counts_into_all_ancestors():
+    """消费叶桶：自身 direct，全部祖先按同一窗口汇总 total。"""
+    root, mid, leaf = _tree3()
+    rid = _rid()
+    r = _consume(rid, leaf, 3)
+    assert r.status_code == 200, r.text
+    leaf_u = client.get(f"/v1/buckets/{leaf}/usage").json()
+    mid_u = client.get(f"/v1/buckets/{mid}/usage").json()
+    root_u = client.get(f"/v1/buckets/{root}/usage").json()
+    assert (leaf_u["direct_used"], leaf_u["total_used"]) == (3, 3)
+    assert (mid_u["direct_used"], mid_u["total_used"]) == (0, 3)
+    assert (root_u["direct_used"], root_u["total_used"]) == (0, 3)
+    # used 作为 total_used 的历史别名保留；remaining 按总量计算
+    assert leaf_u["used"] == leaf_u["total_used"]
+    assert mid_u["remaining"] == mid_u["limit"] - 3
+    # 响应带回 parent_key
+    assert leaf_u["parent_key"] == mid
+    assert root_u["parent_key"] is None
+
+
+def test_shared_ancestor_accumulates_sum_not_duplicate():
+    """一次请求含共享祖先的两个后代：祖先只累计金额之和，事件不重复。"""
+    from app.db import connect
+
+    root, mid, leaf = _tree3()
+    sibling = f"t-sib-{_rid()[:10]}"
+    _put_bucket(sibling, 1000, parent_key=mid)
+
+    rid = _rid()
+    r = _consume_multi(rid, [(leaf, 3), (sibling, 2)])
+    assert r.status_code == 200, r.text
+
+    mid_u = client.get(f"/v1/buckets/{mid}/usage").json()
+    root_u = client.get(f"/v1/buckets/{root}/usage").json()
+    assert mid_u["direct_used"] == 0 and mid_u["total_used"] == 5
+    assert root_u["total_used"] == 5
+
+    # 每个祖先仅一条汇总事件（3+2=5），而非两条 3/2
+    conn = connect()
+    try:
+        rows = conn.execute(
+            "SELECT bucket_key, amount, direct FROM usage_events "
+            "WHERE request_id = ? ORDER BY bucket_key, direct",
+            (rid,),
+        ).fetchall()
+    finally:
+        conn.close()
+    by_bucket: dict[str, list[tuple[int, int]]] = {}
+    for row in rows:
+        by_bucket.setdefault(row["bucket_key"], []).append(
+            (row["amount"], row["direct"])
+        )
+    assert by_bucket[mid] == [(5, 0)]
+    assert by_bucket[root] == [(5, 0)]
+    assert by_bucket[leaf] == [(3, 1)]
+    assert by_bucket[sibling] == [(2, 1)]
+
+
+def test_ancestor_limit_blocks_leaf_consume_atomically():
+    """祖先限额不足 → 429 且任何一层（含叶桶与其他祖先）都不扣减。"""
+    root, mid, leaf = _tree3(root_limit=10, mid_limit=1000, leaf_limit=1000)
+    rid = _rid()
+    r = _consume(rid, leaf, 11)  # 叶桶/中桶充足，但超过祖先 root 的 10
+    assert r.status_code == 429
+    body = r.json()
+    assert [b["key"] for b in body["limited_buckets"]] == [root]
+    lb = body["limited_buckets"][0]
+    assert lb["used"] == 0 and lb["requested"] == 11 and lb["limit"] == 10
+    # 请求量本身超过祖先限额 → 永远不可重试
+    assert body["retry_at"] is None
+    for k in (root, mid, leaf):
+        assert client.get(f"/v1/buckets/{k}/usage").json()["total_used"] == 0
+
+    # 放 4 后叶桶再消费 7：叶桶自身充足，但 root 4+7>10 被整体拒绝
+    assert _consume(_rid(), leaf, 4).status_code == 200
+    r = _consume(_rid(), leaf, 7)
+    assert r.status_code == 429
+    assert "Retry-After" in r.headers
+    assert [b["key"] for b in r.json()["limited_buckets"]] == [root]
+    assert client.get(f"/v1/buckets/{leaf}/usage").json()["total_used"] == 4
+
+    # 多层同时受限时全部列出，整体重试时间取最大值
+    root2, mid2, leaf2 = _tree3(root_limit=10, mid_limit=3, leaf_limit=1000)
+    assert _consume(_rid(), leaf2, 2).status_code == 200  # mid=2,root=2
+    r = _consume(_rid(), leaf2, 2)  # mid 4>3、root 4<=10
+    assert r.status_code == 429
+    assert [b["key"] for b in r.json()["limited_buckets"]] == [mid2]
+
+
+def test_internal_bucket_direct_consume_rolls_up():
+    """直接消费内部桶：本桶记 direct，继续向其祖先汇总。"""
+    root, mid, leaf = _tree3()
+    assert _consume(_rid(), mid, 7).status_code == 200
+    mid_u = client.get(f"/v1/buckets/{mid}/usage").json()
+    root_u = client.get(f"/v1/buckets/{root}/usage").json()
+    leaf_u = client.get(f"/v1/buckets/{leaf}/usage").json()
+    assert (mid_u["direct_used"], mid_u["total_used"]) == (7, 7)
+    assert root_u["total_used"] == 7
+    assert leaf_u["total_used"] == 0  # 消费不向子树传播
+
+
+def test_tree_consume_unknown_bucket_404():
+    """直接点名未配置桶仍是 404，且不写任何贡献。"""
+    root, mid, leaf = _tree3()
+    ghost = f"nope-{_rid()[:10]}"
+    r = _consume_multi(_rid(), [(ghost, 1), (leaf, 1)])
+    assert r.status_code == 404
+    assert client.get(f"/v1/buckets/{root}/usage").json()["total_used"] == 0
+
+
+def test_release_reverts_full_contribution_chain():
+    """释放撤销整条贡献链（直接 + 全部祖先），各层同步恢复。"""
+    root, mid, leaf = _tree3()
+    rid = _rid()
+    assert _consume(rid, leaf, 5).status_code == 200
+    rel = _rid()
+    r = _release(rel, rid)
+    assert r.status_code == 200
+    body = r.json()
+    # released_buckets 只汇总直接点名桶；events_reverted 为整条链事件数
+    assert body["released_buckets"] == [{"key": leaf, "amount": 5}]
+    assert body["events_reverted"] == 3  # leaf direct + mid/root rollup
+    for k in (root, mid, leaf):
+        assert client.get(f"/v1/buckets/{k}/usage").json()["total_used"] == 0
+
+    # 重放释放不重复撤销；容量恢复后新消费可打满祖先
+    assert _release(rel, rid).status_code == 200
+    assert _consume(_rid(), leaf, 1000).status_code == 200
+
+
+def test_release_shared_ancestor_request_reverts_sum_once():
+    """释放含共享祖先的多桶请求：祖先的汇总事件（金额之和）被删一次。"""
+    root, mid, leaf = _tree3()
+    sibling = f"t-sib-{_rid()[:10]}"
+    _put_bucket(sibling, 1000, parent_key=mid)
+    rid = _rid()
+    assert _consume_multi(rid, [(leaf, 3), (sibling, 2)]).status_code == 200
+    r = _release(_rid(), rid)
+    assert r.status_code == 200
+    assert r.json()["events_reverted"] == 4  # 2 direct + mid/root rollup
+    for k in (root, mid, leaf, sibling):
+        assert client.get(f"/v1/buckets/{k}/usage").json()["total_used"] == 0
+
+
+def test_adjust_replaces_full_chain_and_checks_ancestors():
+    """调整按同一展开规则替换整条贡献链，并对目标的各层祖先校验限额。"""
+    root, mid, leaf = _tree3(root_limit=10)
+    rid = _rid()
+    assert _consume(rid, leaf, 4).status_code == 200
+
+    # 目标贡献链 root 需要 11（现存 4 + 新增 7）> 10 → 429 原链保留
+    r = _adjust(_rid(), rid, [(leaf, 11)])
+    assert r.status_code == 429
+    assert [b["key"] for b in r.json()["limited_buckets"]] == [root]
+    for k, used in ((root, 4), (mid, 4), (leaf, 4)):
+        assert client.get(f"/v1/buckets/{k}/usage").json()["total_used"] == used
+
+    # 合法调小：整条链（leaf direct + mid/root rollup）被原子替换
+    r = _adjust(_rid(), rid, [(leaf, 2)])
+    assert r.status_code == 200
+    body = r.json()
+    assert body["previous_buckets"] == [{"key": leaf, "amount": 4}]
+    assert body["buckets"] == [{"key": leaf, "amount": 2}]
+    assert body["events_replaced"] == 3
+    for k in (root, mid):
+        assert client.get(f"/v1/buckets/{k}/usage").json()["total_used"] == 2
+    leaf_u = client.get(f"/v1/buckets/{leaf}/usage").json()
+    assert (leaf_u["direct_used"], leaf_u["total_used"]) == (2, 2)
+
+
+def test_adjust_moves_chain_between_subtrees():
+    """调整把贡献链从一棵子树搬到另一棵：旧祖先恢复，新祖先计入。"""
+    root = f"mv-root-{_rid()[:10]}"
+    m1 = f"mv-m1-{_rid()[:10]}"
+    m2 = f"mv-m2-{_rid()[:10]}"
+    a = f"mv-a-{_rid()[:10]}"
+    b = f"mv-b-{_rid()[:10]}"
+    _put_bucket(root, 1000)
+    _put_bucket(m1, 1000, parent_key=root)
+    _put_bucket(m2, 1000, parent_key=root)
+    _put_bucket(a, 1000, parent_key=m1)
+    _put_bucket(b, 1000, parent_key=m2)
+
+    rid = _rid()
+    assert _consume(rid, a, 5).status_code == 200
+    assert _adjust(_rid(), rid, [(b, 3)]).status_code == 200
+    assert client.get(f"/v1/buckets/{a}/usage").json()["total_used"] == 0
+    assert client.get(f"/v1/buckets/{m1}/usage").json()["total_used"] == 0
+    assert client.get(f"/v1/buckets/{b}/usage").json()["total_used"] == 3
+    assert client.get(f"/v1/buckets/{m2}/usage").json()["total_used"] == 3
+    assert client.get(f"/v1/buckets/{root}/usage").json()["total_used"] == 3
+
+    # 再释放撤销的是调整后的整条链
+    r = _release(_rid(), rid)
+    assert r.status_code == 200
+    assert r.json()["released_buckets"] == [{"key": b, "amount": 3}]
+    assert r.json()["events_reverted"] == 3
+    for k in (root, m1, m2, a, b):
+        assert client.get(f"/v1/buckets/{k}/usage").json()["total_used"] == 0
+
+
+def test_adjust_unknown_target_keeps_chain():
+    """调整到未知桶 → 404，整条原贡献链完整保留。"""
+    root, mid, leaf = _tree3()
+    rid = _rid()
+    assert _consume(rid, leaf, 4).status_code == 200
+    ghost = f"ghost-{_rid()[:10]}"
+    r = _adjust(_rid(), rid, [(ghost, 1)])
+    assert r.status_code == 404
+    for k in (root, mid, leaf):
+        assert client.get(f"/v1/buckets/{k}/usage").json()["total_used"] == 4
+
+
+def test_tree_consume_idempotent_replay_does_not_duplicate_chain():
+    """树消费的幂等重放返回固化判定，祖先汇总不重复累计。"""
+    root, mid, leaf = _tree3()
+    rid = _rid()
+    payload = {"request_id": rid, "buckets": [{"key": leaf, "amount": 3}]}
+    r1 = client.post("/v1/quota/consume", json=payload)
+    assert r1.status_code == 200
+    r2 = client.post("/v1/quota/consume", json=payload)
+    assert r2.status_code == 200
+    assert r2.headers.get("X-Idempotent-Replay") == "true"
+    assert r2.json() == r1.json()
+    for k in (root, mid, leaf):
+        assert client.get(f"/v1/buckets/{k}/usage").json()["total_used"] == 3
+
+
+def test_concurrent_tree_consumes_never_exceed_ancestor_limit():
+    """30 个并发叶桶消费争抢 root=10：恰好放行 10，祖先绝不超限。"""
+    root, mid, leaf = _tree3(root_limit=10, mid_limit=1000, leaf_limit=1000)
+    codes = []
+
+    def hit():
+        codes.append(_consume(_rid(), leaf, 1).status_code)
+
+    threads = [threading.Thread(target=hit) for _ in range(30)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert codes.count(200) == 10
+    assert codes.count(429) == 20
+    assert client.get(f"/v1/buckets/{root}/usage").json()["total_used"] == 10
+    assert client.get(f"/v1/buckets/{mid}/usage").json()["total_used"] == 10
+    assert client.get(f"/v1/buckets/{leaf}/usage").json()["total_used"] == 10
+
+
+def test_audit_semantics_unchanged_with_tree_events():
+    """树消费/释放/调整的审计语义与扁平模式一致：首次各一条、重放不重复。"""
+    root, mid, leaf = _tree3()
+    before = client.get("/v1/audit/verify").json()["checked_count"]
+    rid = _rid()
+    assert _consume(rid, leaf, 2).status_code == 200
+    assert _consume(rid, leaf, 2).status_code == 200  # 重放
+    rel = _rid()
+    assert _release(rel, rid).status_code == 200
+    assert _release(rel, rid).status_code == 200      # 重放
+    rid2 = _rid()
+    assert _consume(rid2, leaf, 2).status_code == 200
+    assert _adjust(_rid(), rid2, [(leaf, 1)]).status_code == 200
+    after = client.get("/v1/audit/verify").json()["checked_count"]
+    assert after - before == 4  # 2 consume + 1 release + 1 adjust
+    # 审计链始终完整
+    assert client.get("/v1/audit/verify").json()["valid"] is True
+
+
+def test_simulation_tree_aware_ancestor_denial_and_peaks():
+    """回放模拟同样沿配额树校验祖先限额，峰值覆盖贡献链上的全部桶。"""
+    root = f"sim-root-{_rid()[:8]}"
+    leaf = f"sim-leaf-{_rid()[:8]}"
+    _put_bucket(root, 5, 100.0)
+    _put_bucket(leaf, 1000, 100.0, parent_key=root)
+    base = 12_000_000
+    # root 限额 5：叶桶放 5 之后，下一笔叶桶消费在模拟中被祖先拒绝
+    _insert_request("tree-a", leaf, 5, base + 1, True)
+    _insert_request("tree-b", leaf, 1, base + 2, True)
+
+    r = _simulate({"from": base, "to": base + 100, "buckets": []})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["transitions"] == {
+        "allowed_to_allowed": 1,
+        "allowed_to_denied": 1,
+        "denied_to_allowed": 0,
+        "denied_to_denied": 0,
+    }
+    peaks = {p["key"]: p["simulated_peak"] for p in body["bucket_peaks"]}
+    # 峰值覆盖叶桶与祖先；被拒请求不占用，峰值停在 5
+    assert peaks == {leaf: 5, root: 5}
+    flip = body["flip_details"][0]
+    assert flip["request_id"] == "tree-b"
+    assert flip["simulated_decision"] == "denied"
+
+
+def test_simulation_tree_shared_ancestor_no_duplicate():
+    """模拟中共享祖先的两个后代只累计金额之和，不因展开而重复计数。"""
+    root = f"sim-sh-r-{_rid()[:8]}"
+    mid = f"sim-sh-m-{_rid()[:8]}"
+    a = f"sim-sh-a-{_rid()[:8]}"
+    b = f"sim-sh-b-{_rid()[:8]}"
+    _put_bucket(root, 100, 100.0)
+    _put_bucket(mid, 100, 100.0, parent_key=root)
+    _put_bucket(a, 100, 100.0, parent_key=mid)
+    _put_bucket(b, 100, 100.0, parent_key=mid)
+    base = 13_000_000
+    _insert_request_multi(
+        "sh-1",
+        [{"key": a, "amount": 3}, {"key": b, "amount": 2}],
+        base + 1,
+        True,
+    )
+    r = _simulate({"from": base, "to": base + 100, "buckets": []})
+    assert r.status_code == 200, r.text
+    peaks = {p["key"]: p["simulated_peak"]
+             for p in r.json()["bucket_peaks"]}
+    assert peaks[mid] == 5 and peaks[root] == 5 and peaks[a] == 3 and peaks[b] == 2
+    assert r.json()["transitions"]["allowed_to_allowed"] == 1
+
+
+def test_seed_tree_out_of_order_and_bad_config_rejected():
+    """播种支持乱序 parent_key；缺失父桶/环的配置文件整体不生效。"""
+    import tempfile
+
+    from app.db import connect as _connect, init_db, seed_buckets
+
+    d = tempfile.mkdtemp(prefix="quota-seed-")
+    dbp = os.path.join(d, "seed.db")
+    init_db(dbp)  # 与 lifespan 一致：先建表再播种
+
+    good = os.path.join(d, "good.json")
+    with open(good, "w") as fh:
+        json.dump({"buckets": [
+            {"key": "s-leaf", "limit": 1, "window_seconds": 60,
+             "parent_key": "s-mid"},
+            {"key": "s-root", "limit": 1, "window_seconds": 60},
+            {"key": "s-mid", "limit": 1, "window_seconds": 60,
+             "parent_key": "s-root"},
+        ]}, fh)
+    assert sorted(seed_buckets(good, dbp)) == ["s-leaf", "s-mid", "s-root"]
+    conn = _connect(dbp)
+    try:
+        parents = dict(conn.execute(
+            "SELECT key, parent_key FROM buckets ORDER BY key"
+        ).fetchall())
+    finally:
+        conn.close()
+    assert parents == {"s-leaf": "s-mid", "s-mid": "s-root", "s-root": None}
+
+    bad = os.path.join(d, "bad.json")
+    with open(bad, "w") as fh:
+        json.dump({"buckets": [
+            {"key": "s-leaf", "limit": 9, "window_seconds": 60,
+             "parent_key": "missing-parent"},
+        ]}, fh)
+    import pytest
+    with pytest.raises(Exception):
+        seed_buckets(bad, dbp)
+    conn = _connect(dbp)
+    try:
+        # 失败播种整体回滚：s-leaf 仍为旧配置且树关系不变
+        row = conn.execute(
+            "SELECT limit_amount, parent_key FROM buckets WHERE key = 's-leaf'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row[0] == 1 and row[1] == "s-mid"
